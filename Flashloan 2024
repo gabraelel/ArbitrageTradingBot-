@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
+import "@uniswap/v2-periphery/UniswapV2Router02.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@balancer-labs/v2-vault/contracts/interfaces/IVault.sol";
+import "@balancer-labs/v2-vault/contracts/interfaces/IFlashLoanRecipient.sol";
+import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
+import "@uniswap/v3-core/contracts/libraries/FixedPoint128.sol";
+import "@uniswap/v3-core/contracts/libraries/FullMath.sol";
+
+// Event for Ether withdrawal
+event EtherWithdrawn(address indexed recipient, uint256 amount);
+// Event for profit transfer
+event ProfitsTransferred(address indexed recipient, uint256 amount);
+// Event for fee payment
+event FeesPaid(address indexed recipient, uint256 amount);
+
+// Contract definition
+contract ArbitrageTradingBot is OwnableUpgradeable, UUPSUpgradeable, ReentrancyGuardUpgradeable {
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+    using SafeMathUpgradeable for uint256;
+
+    // Instances of external contracts
+    UniswapV2Router02 public uniswapRouter;
+    AggregatorV3Interface public linkWethPriceFeed;
+    AggregatorV3Interface public wethLinkPriceFeed;
+    IVault public balancerVault;
+
+    // Addresses for external contracts
+    address private etherRecipient;
+    address constant LINK_ADDRESS = 0x514910771AF9Ca656af840dff83E8264EcF986CA;
+    address constant WETH_ADDRESS = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+    // Parameters
+    uint256 public minLiquidityThreshold;
+    uint256 public loanAmount = 1_000_000 ether; // Set the loan amount to 1 million WETH
+
+    // Modifier for only owner
+    modifier onlyOwner() {
+        require(msg.sender == owner(), "Only owner can call this function");
+        _;
+    }
+
+    // Constructor
+    function initialize(
+        address _owner,
+        address _uniswapRouter,
+        address _linkWethPriceFeed,
+        address _wethLinkPriceFeed,
+        address _balancerVault,
+        uint256 _minLiquidityThreshold
+    ) initializer public {
+        __Ownable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        etherRecipient = _owner; // Set the recipient to the provided owner address
+
+        uniswapRouter = UniswapV2Router02(_uniswapRouter);
+        linkWethPriceFeed = AggregatorV3Interface(_linkWethPriceFeed);
+        wethLinkPriceFeed = AggregatorV3Interface(_wethLinkPriceFeed);
+        balancerVault = IVault(_balancerVault);
+        minLiquidityThreshold = _minLiquidityThreshold;
+
+        // Set owner
+        transferOwnership(_owner);
+    }
+
+    // Function to set the minimum liquidity threshold
+    function setMinLiquidityThreshold(uint256 _minLiquidityThreshold) external onlyOwner {
+        minLiquidityThreshold = _minLiquidityThreshold;
+    }
+
+    // Function to execute arbitrage
+    function executeArbitrage() external onlyOwner nonReentrant {
+        // Check liquidity on Uniswap V2
+        uint256 uniLiquidity = getUniswapLiquidity();
+        require(uniLiquidity >= minLiquidityThreshold, "Insufficient liquidity on Uniswap V2");
+
+        // Check arbitrage opportunity
+        if (checkArbitrageOpportunity()) {
+            // Perform arbitrage actions
+            arbitrageOpportunityDetected(etherRecipient); // Pass owner's address to pay fees
+        }
+    }
+
+    // Callback function called by ArbitrageWatcher after watching for arbitrage
+    function arbitrageOpportunityDetected(address recipient) internal {
+        // Initiate arbitrage loan using BalancerVault
+        balancerVault.initiateFlashLoan(address(this), loanAmount);
+
+        // Pay fees
+        payFees();
+
+        // Repay loan to Balancer and transfer remaining profits
+        repayLoanAndTransferProfits();
+    }
+
+    // Internal function to transfer Ether to the specified recipient
+    function _transferEtherToRecipient() internal {
+        payable(etherRecipient).transfer(address(this).balance);
+        emit EtherWithdrawn(etherRecipient, address(this).balance);
+    }
+
+    // Internal function to check liquidity on Uniswap V2
+    function getUniswapLiquidity() internal view returns (uint256) {
+        address pair = IUniswapV2Pair(uniswapRouter.WETH()).pairFor(uniswapRouter.factory(), uniswapRouter.WETH());
+        (uint112 reserve0, , ) = IUniswapV2Pair(pair).getReserves();
+        return reserve0;
+    }
+
+    // Function to check arbitrage opportunity between LINK and WETH on Uniswap V2
+    function checkArbitrageOpportunity() internal view returns (bool) {
+        (, int256 linkWethPrice, , , ) = linkWethPriceFeed.latestRoundData();
+        require(linkWethPrice > 0, "Invalid LINK/WETH price feed");
+
+        (, int256 wethLinkPrice, , , ) = wethLinkPriceFeed.latestRoundData();
+        require(wethLinkPrice > 0, "Invalid WETH/LINK price feed");
+
+        // Fetch reserves from Uniswap V2 LINK/WETH pair
+        address linkWethPair = uniswapRouter.pairFor(LINK_ADDRESS, uniswapRouter.WETH());
+        (uint112 linkReserve, uint112 wethReserve, ) = IUniswapV2Pair(linkWethPair).getReserves();
+
+        // Calculate the price of LINK in WETH
+        uint256 priceInWeth = uint256(linkReserve) * 1e18 / uint256(wethReserve);
+
+        // Calculate the price of WETH in LINK
+        uint256 priceInLink = uint256(wethReserve) * 1e18 / uint256(linkReserve);
+
+        // Check for arbitrage opportunity
+        if (priceInWeth > uint256(linkWethPrice)) {
+            return true; // Arbitrage opportunity detected: buy LINK on Uniswap V2, sell LINK on Uniswap V3
+        } else if (priceInLink > uint256(wethLinkPrice)) {
+            return true; // Arbitrage opportunity detected: buy WETH on Uniswap V3, sell WETH on Uniswap V2
+        } else {
+            return false; // No arbitrage opportunity detected
+        }
+    }
+
+    // Function to pay fees
+    function payFees() internal {
+        // Example fee amount
+        uint256 feeAmount = 0.01 ether;
+
+        // Transfer fees to the recipient
+        payable(etherRecipient).transfer(feeAmount);
+        emit FeesPaid(etherRecipient, feeAmount);
+    }
+
+    // Function to repay loan to Balancer and transfer remaining profits
+    function repayLoanAndTransferProfits() internal {
+        // Repay loan to Balancer
+        balancerVault.repayFlashLoan();
+
+        // Transfer remaining LINK profits to owner's wallet
+        uint256 linkBalance = IERC20Upgradeable(LINK_ADDRESS).balanceOf(address(this));
+        if (linkBalance > 0) {
+            IERC20Upgradeable(LINK_ADDRESS).safeTransfer(etherRecipient, linkBalance);
+            emit ProfitsTransferred(etherRecipient, linkBalance);
+        }
+    }
+
+    // UUPS upgrade function
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    // Fallback function to receive Ether and ERC20 tokens
+    fallback() external payable {
+        if (msg.value > 0) {
+            // Transfer all received Ether to the owner's MetaMask wallet address
+            payable(owner()).transfer(msg.value);
+        } else {
+            // Handle unexpected token transfers
+            // Automate the process of transferring all received tokens to the owner's MetaMask wallet address
+            IERC20Upgradeable token = IERC20Upgradeable(msg.sender);
+            uint256 balance = token.balanceOf(address(this));
+            token.transfer(owner(), balance);
+        }
+    }
+
+    // Fallback function to receive Ether
+    receive() external payable {
+        // Additional logic if needed
+    }
+}
